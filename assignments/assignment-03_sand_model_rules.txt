@@ -1,0 +1,507 @@
+SAND MODEL - PHYSICAL RULES AND WORK LOG
+==========================================
+Project: realistic simulation of DRY sand (single grains + their interaction)
+Status : IMPLEMENTED in src/cdf/material_processes_sand.py (section 6).
+         Physics tested in plain Python; Rhino part not yet run in Rhino.
+         Drop-height law preliminary until the parameter study (section 5).
+
+How to read the tags in this file
+---------------------------------
+  [LIT]  law or value taken from the literature (source number in section 8)
+  [STD]  standard practice in Discrete Element Method (DEM) codes
+  [OBS]  our own observation from the pouring exercise (to be verified)
+  [ASM]  our own modelling assumption / derived rule - must be calibrated
+         against a real pouring experiment before we trust it
+
+
+------------------------------------------------------------------------------
+1. STEPS DONE SO FAR
+------------------------------------------------------------------------------
+ 1.1 Read the given course material (read only, nothing changed):
+     - src/cdf/material_processes_0.py
+         sand_ridge_along_curve, sand_ridge_along_curve_variable,
+         sand_cones_at_points (cone from volume + fixed slope angle 34 deg,
+         V = pi r^2 h / 3, r = h / tan(slope)).
+     - exercises/material-processes-0/sand_pouring_geometric.ghx
+         geometric ridges and cones.
+     - exercises/material-processes-0/sand_pouring_simulation.ghx
+         a) 2D falling-sand cellular automaton (grid)
+         b) 3D falling-sand voxel automaton
+         c) 2D falling disks with impulse-based contacts, Coulomb friction,
+            rolling damping, one particle size.
+ 1.2 Identified what is NOT realistic in these examples:
+     - geometric cone: angle is an input, not a result of physics
+     - cellular automata: the slope is a product of the grid rules
+     - disk simulation: only 2D, all grains same size, repose angle obtained
+       by tuned "multiplier" constants instead of material parameters,
+       no air drag, no real static friction memory, slow (pure python loops)
+ 1.3 Collected our own observations of pouring sand (section 4).
+ 1.4 Literature search for physical laws of dry sand (sections 2, 3, 8).
+ 1.5 Decision: keep the sand DRY for now (no cohesion, no liquid bridges).
+ 1.6 Wrote this rule file.
+ 1.7 Implemented the grain simulation (DEM, rules 2.1 - 2.7) and the pile
+     measurement (3.1, 3.5, 3.6, 4.2).
+     Tests (plain Python, outside Rhino):
+       - neighbour search finds exactly the same pairs as brute force
+       - single grain dropped on the ground bounces with e ~ 0.48
+         (0.4 set; the damping formula is approximate)
+       - rolling grain stops because of rolling resistance
+       - terminal velocity of 0.3 mm sand computed as 2.33 m/s
+ 1.8 First pile tests (grain radius 4 mm, ~1000-1300 grains):
+       drop height  3 cm -> angle 31.6 deg, tip radius  4 cm (sharper)
+       drop height 30 cm -> angle 22.4 deg, tip radius 13 cm (rounder)
+     -> confirms observations 4.3 / 4.4 (higher drop = flatter, rounder).
+     Caveat: in the 3 cm run the pile grew above the outlet and buried it
+     (use follow_pile). Both piles are small (rule 3.4: small piles are
+     flatter), so the absolute angles are still too low -> calibrate mu_r.
+ 1.9 Speed-up: Verlet neighbour list (candidate pairs reused until a grain
+     moved half the safety margin) -> ~2x faster.
+ 1.10 Restructured everything into ONE file
+      src/cdf/material_processes_sand.py (Part 1 physics, Part 2 Rhino).
+ 1.11 Emitter: drop height + outlet diameter as inputs; the flow rate
+      follows from the outlet diameter (Beverloo, real grain size);
+      the outlet can move along a path with a given speed.
+ 1.12 Added the link between physics and geometry (section 6.2):
+      SandLaw + SandField. Tests: mass is conserved exactly, the steepest
+      slope never exceeds the law angle, 3 cm drop -> 34.0 deg cone,
+      30 cm drop -> 24.8 deg cone, sand poured over an obstacle does not
+      erode it, ridge mass = flow rate / outlet speed x length.
+
+
+------------------------------------------------------------------------------
+2. GRAIN-SCALE RULES (what each particle does)
+------------------------------------------------------------------------------
+The model is a 3D soft-sphere Discrete Element Method (DEM): every grain is a
+sphere with position x, velocity v, angular velocity w, radius R, mass m.
+Grains may overlap very slightly; the overlap delta produces the contact
+force (spring + damper).                                              [STD]
+
+2.1 Motion (Newton's laws)                                            [STD]
+      m  dv/dt = m g + sum(F_contact) + F_drag
+      I  dw/dt = sum(r x F_t) + sum(M_roll)          I = 2/5 m R^2
+    Integration: velocity Verlet.
+    Time step: dt <= 0.2 * T_Rayleigh,
+      T_Rayleigh = pi R sqrt(rho/G) / (0.1631 nu + 0.8766)
+    (G shear modulus, nu Poisson ratio). Because real quartz stiffness gives
+    tiny time steps, E is reduced to ~1e7 Pa; the literature shows the angle
+    of repose is NOT sensitive to Young's modulus, density, Poisson ratio or
+    the damping coefficient, so this is allowed.                      [LIT 7]
+
+2.2 Normal contact force - Hertz law                                  [STD]
+      R* = R1 R2/(R1+R2)      m* = m1 m2/(m1+m2)
+      E* = E / (2 (1 - nu^2))   (same material)
+      F_n = 4/3 E* sqrt(R*) delta^(3/2)            (repulsive spring)
+    Damping from the coefficient of restitution e:
+      beta = ln(e) / sqrt(ln(e)^2 + pi^2)
+      S_n  = 2 E* sqrt(R* delta)
+      F_nd = -2 sqrt(5/6) beta sqrt(S_n m*) v_n    (v_n normal rel. speed)
+    => slow grains stick, fast grains bounce a little (e ~ 0.3 - 0.5).
+
+2.3 Tangential contact force - Mindlin + Coulomb                      [STD]
+      S_t = 8 G* sqrt(R* delta)
+      F_t = -S_t * xi_t  (xi_t = accumulated tangential slip of THIS contact,
+                          stored as long as the contact exists = static
+                          friction memory)
+      |F_t| <= mu_s * |F_n|   (Coulomb limit; if exceeded the grain slides)
+    Sliding friction mu_s ~ 0.5 for quartz sand.
+    The angle of repose increases with sliding friction.               [LIT 6,7]
+
+2.4 Rolling resistance (replaces grain shape)                    [LIT 8, STD]
+    Real sand grains are angular, not round. Perfect spheres roll away and
+    give piles that are far too flat. A rolling resistance torque mimics the
+    shape (elastic-plastic spring-dashpot type, Ai et al. 2011):
+      k_r     = 2.25 k_n mu_r^2 R*^2
+      M_r     = -k_r * theta_r          (spring on relative rolling angle)
+      |M_r|  <= mu_r R* |F_n|           (plastic limit)
+    mu_r ~ 0.1 - 0.3, calibrated so a test pile reaches ~34 deg.
+    The angle of repose increases strongly with rolling friction.      [LIT 6,7]
+    Rough, angular sand piles steeper than smooth rounded sand.         [LIT 1]
+
+2.5 Ground and walls                                                  [STD]
+    Same contact laws against planes and Rhino meshes (sphere-triangle
+    contact). A rough ground (higher mu) holds the bottom grains in place.
+
+2.6 Air drag (needed for realistic drop height)                 [LIT 13, STD]
+      Re  = rho_air |v| d / mu_air
+      C_d = 24/Re (1 + 0.15 Re^0.687)    (Schiller-Naumann, Re < 1000)
+      F_drag = -1/2 rho_air C_d (pi d^2/4) |v| v
+    Terminal velocity of a 0.3 mm quartz grain in air: about 2.3 m/s
+    (our own calculation with this formula, Re ~ 47; to be checked).
+    Compare: free fall without air from 1 m gives 4.4 m/s.
+    => above roughly 0.5 - 1 m drop height, fine sand barely gets faster.
+    Real sand grains fall a bit slower than spheres (shape factor ~0.7). [LIT 13]
+
+2.7 Grain size distribution                                          [ASM]
+    Radii drawn from a lognormal distribution, fine sand d50 ~ 0.2-0.5 mm.
+    Real grain numbers are impossible -> "coarse-grained" particles of a
+    few mm. Note: larger particles give LOWER angles of repose in DEM, so
+    the calibration of mu_r has to be done at the particle size we use. [LIT 7]
+
+2.8 Material parameter table (dry quartz sand)
+      grain density rho_p      2650 kg/m^3
+      bulk density             ~1500 - 1700 kg/m^3 (packing fraction 0.58-0.64)
+      Young's modulus E        1e7 Pa (reduced, see 2.1)
+      Poisson ratio nu         0.25
+      restitution e            0.3 - 0.5
+      sliding friction mu_s    0.5
+      rolling friction mu_r    0.1 - 0.3 (calibrated)
+      air density / viscosity  1.2 kg/m^3 / 1.8e-5 Pa s
+      gravity g                9.81 m/s^2
+
+
+------------------------------------------------------------------------------
+3. PILE-SCALE LAWS (what the whole heap must do - used to CHECK the model)
+------------------------------------------------------------------------------
+These laws are not programmed directly. They must COME OUT of the grain
+rules in section 2. If they do not, the grain parameters are wrong.
+
+3.1 Angle of repose of dry sand                                     [LIT 1,2]
+      dry sand, pile angle  ~ 34 - 35 deg
+      crater (hole) angle   ~ 39 deg
+    The crater value is close to the "angle of maximum stability".
+
+3.2 Two angles: static vs. dynamic (hysteresis)                [LIT 1,9,10]
+    - A slope stays still until it reaches the angle of maximum stability
+      theta_max (steepest possible).
+    - Then an avalanche starts and the slope relaxes to the lower angle of
+      repose theta_r.  theta_max - theta_r ~ a few degrees.
+    - Continuous flow gives a smaller angle than slow static building.
+    => This is the physical reason for observation 4.1 ("slow -> steeper").
+
+3.3 Flowing layer on the slope - mu(I) rheology              [LIT 11]
+    In the moving surface layer the effective friction depends on how fast
+    it is sheared:
+      I     = gamma_dot d / sqrt(P / rho_p)     (inertial number)
+      mu(I) = mu_s + (mu_2 - mu_s) / (I0 / I + 1)
+      slope angle of flowing layer: tan(theta) = mu(I)
+    Values measured for glass beads: mu_s = tan(20.9 deg),
+    mu_2 = tan(32.76 deg), I0 = 0.279 (sand values differ, must be fitted).
+    mu_s corresponds to the quasi-static angle of repose.
+    Limitation: mu(I) does not capture hysteresis.                    [LIT 11]
+    Used for: (a) checking the DEM, (b) a fast continuum model later.
+
+3.4 Pile size                                                        [LIT 12]
+    Very small piles have a LOWER angle; the angle rises with the number
+    of grains and then settles to a constant value.
+    => our test piles must be large enough (thousands of grains) before we
+       measure the angle.
+
+3.5 Shape of the cone (not a perfect cone!)                   [LIT 4,5,14,15]
+    a) Flanks: nearly straight at theta_r, but often slightly CONVEX. [LIT 15]
+    b) Foot / tail: at the bottom the slope runs out with a logarithmic
+       correction (concave tail), not a sharp edge.             [LIT 4,14]
+    c) Top: the tip is ROUNDED, not sharp. The rounding of the top of a
+       heap is discussed in Herrmann 1999.                           [LIT 14]
+    d) The top position wanders sideways while the pile grows (avalanches
+       left/right).                                                  [LIT 16]
+    e) Under the apex the pressure on the ground has a DIP (minimum), it is
+       not maximal under the highest point.                          [LIT 4,5]
+
+3.6 Apex sharpness rule (how "spitz" the top is)                    [ASM]
+    No closed literature formula found. Our model rule:
+      The top is flat/rounded over the zone where grains land and are still
+      moving. Rounding radius at the top
+        r_top ~ r_stream + r_bounce
+        r_stream = radius of the falling stream where it hits the pile
+        r_bounce = typical horizontal jump after impact ~ (e v_imp)^2 / g
+                   (ballistic jump, v_imp = impact speed from 2.6)
+      Consequences:
+        - low drop height, narrow stream -> small r_top -> SHARP apex
+        - high drop height -> faster impact -> bigger jumps -> ROUND apex
+        - wide stream / moving source -> flat top (ridge with crest, like
+          crest_width in sand_ridge_along_curve)
+      Must be checked with a DEM parameter study and a real experiment.
+
+3.7 Pour rate from a funnel / hopper - Beverloo law               [LIT 3]
+      W = C rho_b sqrt(g) (D - k d)^(5/2)       [kg/s]
+        D outlet diameter, d grain diameter, rho_b bulk density
+        C ~ 0.5 - 0.7, k ~ 1.2 - 3 (k ~ 2.9 reported for sand)
+      valid when D is large enough to avoid jamming and grains > ~0.5 mm.
+      2D / slit outlet: exponent 3/2 instead of 5/2.
+    Used to set a REALISTIC flow rate in the emitter.
+
+
+------------------------------------------------------------------------------
+4. OUR OBSERVATIONS AND HOW THE MODEL EXPLAINS THEM
+------------------------------------------------------------------------------
+4.1 "The lower the speed, the higher and steeper the cone"           [OBS]
+    Explanation: slow arrival -> grains stop before the next arrive -> slope
+    can build up close to theta_max (3.2). Fast pour -> continuous flowing
+    layer -> slope follows mu(I) at the lower dynamic angle (3.3).
+    Literature confirms discharge rate changes the angle of repose.    [LIT 2]
+    Model input: emitter flow rate Q (kg/s), Beverloo (3.7).
+
+4.2 "Frequency of hitting the bottom"                          [OBS, ASM]
+      impact frequency f = Q / m_grain
+      settling time  t_s ~ time a grain needs to stop after impact
+      ratio Pi = f * t_s
+        Pi << 1 : grains arrive one by one -> quasi-static, steep cone
+        Pi >> 1 : grains disturb each other -> flowing surface, flatter cone
+    The model measures Pi in every run and outputs it with the result.
+
+4.3 "The nearer, the steeper the cone"                          [OBS, ASM]
+    Small drop height h -> low impact speed v_imp = sqrt(2 g h) (with drag:
+    2.6) -> little energy -> grains stop where they land -> steep cone,
+    sharp apex (3.6).
+
+4.4 "Higher distance -> more energy and broader spread"         [OBS, ASM]
+    Impact energy E = 1/2 m v_imp^2 grows with h until terminal velocity
+    (2.6) is reached. More energy -> grains bounce and roll further,
+    surface layer is "fluidized" -> flatter flank, wider base, rounder top,
+    sometimes a small crater at the impact point. The stream itself also
+    widens while falling (collisions between grains in the air).
+    Supporting literature: more potential energy -> more friction overcome
+    -> lower final angle (shown for column collapse, not yet for pouring).
+    No study found that isolates drop height for pouring -> we must test
+    this ourselves (section 5).
+
+
+------------------------------------------------------------------------------
+5. VALIDATION PLAN (how we prove it is realistic)
+------------------------------------------------------------------------------
+ 5.1 Calibration pile: pour from low height, slow rate. Adjust mu_r until
+     the angle is 34 +- 1 deg (3.1).
+ 5.2 Parameter sweep: drop height h = 0.05, 0.1, 0.2, 0.5, 1.0 m  x
+     flow rate Q = 3 values. Measure for every run:
+       - flank angle (fit line through surface grains)
+       - height H, base radius r_base, H / r_base
+       - apex rounding radius r_top (fit circle to the top profile)
+       - tail length at the foot, crater depth
+       - impact frequency ratio Pi (4.2)
+ 5.3 Plot angle vs. h and angle vs. Q. Expected trends: 4.1, 4.3, 4.4.
+ 5.4 Real experiment with the same h and Q (funnel, ruler, phone photo,
+     measure angle). Compare with 5.3.
+ 5.5 Check Beverloo flow rate from a simulated hopper (3.7).
+ 5.6 Fit a formula theta(h, Q) and r_top(h, Q) from the results and use it
+     in an improved fast geometric cone function (replacing the fixed
+     slope_angle = 34 in sand_cones_at_points).
+
+
+------------------------------------------------------------------------------
+6. CODE STRUCTURE: src/cdf/material_processes_sand.py (one file)
+------------------------------------------------------------------------------
+6.1 PART 1 - PHYSICAL BEHAVIOUR (numpy only, runs in Rhino and plain Python)
+   1.1 SandMaterial     values of table 2.8, time step, terminal velocity
+   1.2 contacts         neighbour search, Hertz-Mindlin (2.2, 2.3),
+                        rolling resistance (2.4), contact memory
+   1.3 PourEmitter      drop height, outlet diameter, flow rate (Beverloo
+                        3.7 if not given), grain sizes (2.7), follow_pile,
+                        moving outlet along a path (outlet_speed)
+   1.4 ParticleSystem   gravity, air drag (2.6), ground/plane walls (2.5),
+       Simulation       velocity Verlet (2.1), impact/settle bookkeeping
+   1.5 analyse_pile     angle, height, apex radius, tail, crater, packing,
+       parameter_study  impact ratio Pi (3.x, 4.2, 5.2)
+   1.6 SandLaw          pile-scale rules for design (see 6.2)
+   1.7 SandField        fast sand surface model (see 6.2)
+
+6.2 HOW THE PHYSICS REACHES EVERY GEOMETRY
+   Two levels, both obeying the same laws:
+   a) EXACT: grain simulation (DEM). The shape is the result of grains
+      colliding -> all grain rules hold automatically. Slow (minutes).
+   b) FAST: SandField (height field) driven by a SandLaw:
+        - poured mass / bulk density = sand volume (mass conservation)
+        - sand lands on a disk of radius
+             r = outlet_diameter/2 + (e * v_impact)^2 / g      (rule 3.6)
+          -> wide stream or high drop = round / flat tip
+        - avalanche: sand slides wherever a slope is steeper than
+             angle = 34 deg + b ln(v_impact / v_ref) + c ln(Q / Q_ref)
+          clamped to [20, 39] deg (3.1, 3.2, 4.1, 4.3, 4.4)
+        - v_impact from the fall with air drag (2.6) -> saturates at
+          terminal velocity; Q from the outlet diameter (Beverloo 3.7)
+        - drop height measured to the CURRENT surface (growing pile)
+        - existing geometry is a fixed base the sand cannot erode
+      b = -12.2 is PRELIMINARY (from the two grain runs in 1.8); c = 0
+      until a flow study is done. SandLaw.from_study(parameter_study(...))
+      replaces them with values calibrated by grain simulations.
+   => every builder in Part 2 uses one of these two levels, so for any
+      shape (points, curves, poured onto meshes) the same laws are met.
+
+6.3 PART 2 - BUILDING AND MODELING (Rhino.Geometry)
+   All lengths in Rhino model units (converted to metres inside).
+   fast:  sand_pile_at_points, sand_ridge_along_curve_physical, sand_on_mesh
+   exact: grain_pour_at_points, grain_pour_along_curve, gh_pour (GH Timer)
+   helpers: field_to_mesh, base_from_mesh, grains_to_mesh,
+            grains_to_points, grains_to_field_mesh, profile_curve
+   Rhino is imported inside try/except, so Part 1 can be tested without
+   Rhino. Part 2 was so far only tested with a stand-in for Rhino, not in
+   Rhino itself.
+
+6.4 WHERE THE PARAMETER VALUES COME FROM
+   a) Literature (measured facts about sand)
+      - grain density 2650 kg/m^3 (quartz)                         [LIT 1]
+      - angle of repose 34 deg, dry sand                         [LIT 1,2]
+      - maximum angle 39 deg (crater angle = steepest slope that
+        stands before it avalanches)                              [LIT 2]
+      - Beverloo constants C = 0.58, k = 2.9 (k reported for sand) [LIT 3]
+      - air density 1.2 kg/m^3, air viscosity 1.8e-5 Pa s (constants)
+   b) Typical values used in grain simulations (DEM)          [STD, LIT 6-8]
+      - sliding friction 0.5, restitution 0.4, Poisson ratio 0.25
+      - rolling friction 0.2 (middle of the usual range 0.1 - 0.3)
+      - Young's modulus 1e7 Pa: much softer than real quartz (~7e10 Pa)
+        so the simulation runs fast; the angle of repose is hardly
+        affected by this                                          [LIT 7]
+   c) Calculated from physics
+      - impact speed: fall from the drop height incl. air drag on a real
+        0.3 mm grain (rule 2.6)
+      - landing spread: ballistic jump after impact (rule 3.6)
+      - flow rate: from the outlet diameter with the Beverloo law (3.7)
+   d) Estimated by us from two test runs                          [ASM]
+      - drop-height factor b = -12.2: the grain simulation gave 31.6 deg
+        at 3 cm and 22.4 deg at 30 cm drop height; b was chosen so the
+        SandLaw formula reproduces this 9.2 deg difference, anchored at
+        the literature value 34 deg for a 3 cm drop
+      - flow-rate factor c = 0: not measured yet (no effect for now)
+      - lower angle limit 20 deg: own safety bound
+
+   No full calibration was done (section 5.1 - 5.3 not run). The exact
+   numbers are ESTIMATES. For this project the important point is that
+   the effects are contained in the model and based on physics:
+      - higher drop -> faster impact -> flatter cone, rounder tip;
+        levels off at terminal velocity because of air drag
+      - wider outlet -> larger flow rate and wider stream
+   Optional later: SandLaw.from_study(parameter_study(...)) replaces the
+   estimated b and c with values fitted to grain simulations.
+
+6.5 DIFFERENCES BETWEEN THE GRAIN SIMULATION AND THE SANDFIELD
+   Grain simulation (DEM): every grain is a sphere; in tiny time steps
+   (~0.00002 s) gravity, air drag and all contacts (push, friction,
+   rolling resistance) are computed. Nobody prescribes the pile shape --
+   it forms by itself from the collisions.
+   SandField: a grid that only stores the HEIGHT of the sand surface.
+   Sand is added where the stream lands and slides to the neighbour
+   cell wherever a slope is steeper than the allowed angle.
+
+                         grain simulation          SandField
+   what is computed      every single grain        only surface height
+   source of physics     directly from collisions  from rules (SandLaw)
+   speed                 minutes per pile          seconds
+   use                   check / explain the       design of any shape
+                         physics, animation        in Rhino
+
+   How each physical effect is included in the SandField:
+     friction, rolling resistance,  summarised in ONE number:
+     grain shape                    the angle of repose
+     fall with air drag             computed exactly (impact speed)
+     impact energy, bouncing        wider landing zone + flatter angle
+                                    at higher impact speed
+     outlet size -> flow rate       Beverloo law, computed exactly
+     mass conservation              exact
+     avalanches on the slope        simplified: sand slides where too steep
+
+   NOT contained in the SandField (only in the grain simulation):
+     - individual collisions, rolling and bouncing of grains
+     - convex flank and logarithmic tail at the foot (3.5 a, b)
+     - timing: impact frequency vs settling time (4.2); the flow rate
+       enters only through c, which is 0 for now
+     - segregation of large and small grains
+     - randomness: equal inputs give identical SandField piles
+
+   Why two levels: simulating every grain of a real pile would take
+   days. As in engineering practice, the detailed simulation (or an
+   experiment) is used to find simple rules, and the rules are applied at
+   large scale. The SandField is this "summary" of the grain physics:
+     level 1  grain simulation: the complex physics happens here and shows
+              WHY e.g. a higher drop gives a flatter pile
+     level 2  SandField: carries these results over to any shape in Rhino
+
+6.6 HOW THE SANDFIELD KNOWS THE ANGLE OF REPOSE
+   Before every portion of sand is poured, the SandField asks the
+   SandLaw for the allowed angle:
+     1. drop height h = outlet height - current sand surface below it
+        (the pile grows -> h gets smaller -> the angle changes during
+        the pour)
+     2. impact speed v from the fall with air drag (physics, rule 2.6)
+     3. angle = 34 deg + b ln(v / v_ref) + c ln(Q / Q_ref),
+        clamped to 20 - 39 deg
+     4. landing radius = outlet_diameter/2 + (e v)^2 / g
+   Then the sand is deposited and slides until no slope is steeper than
+   this angle.
+   Which physical laws are inside, and how:
+     explicit   air drag / fall (v), Beverloo (Q), ballistic jump with
+                restitution e (landing radius), mass conservation
+     implicit   friction, rolling resistance and collisions are NOT
+                computed, but their effect is contained in b, which was
+                measured with the grain simulation (where they ARE
+                computed)
+     literature the base value 34 deg comes from measurements of real
+                dry sand, not from our grain simulation
+   So the SandField contains the grain physics only indirectly, through
+   numbers measured with the grain simulation or in the literature.
+
+
+------------------------------------------------------------------------------
+7. KNOWN LIMITATIONS
+------------------------------------------------------------------------------
+ - Spheres + rolling resistance instead of real grain shapes.
+ - Coarse-grained particles: mass and drag of one model particle differ
+   from a real grain -> drop height effects must be scaled carefully.
+ - Dry sand only (no moisture / cohesion) - by decision.
+ - Apex and drop-height rules (3.6, 4.2-4.4) are our assumptions until
+   validated (section 5).
+ - SandField reproduces angle, mass, tip rounding and drop-height effect,
+   but not the convex flank, the log tail at the foot or the pressure dip
+   (3.5 a, b, e); those only appear in the grain simulation.
+ - Walls from Rhino meshes are not yet in the grain simulation (only
+   planes); in the SandField meshes work as a base.
+ - If the outlet is lower than the growing pile it is buried; the
+   SandField then uses the steepest allowed angle (39 deg).
+
+
+------------------------------------------------------------------------------
+8. SOURCES
+------------------------------------------------------------------------------
+ [1]  Angle of repose (overview, dry sand ~34 deg, angular vs rounded
+      grains, static vs dynamic methods).
+      https://en.wikipedia.org/wiki/Angle_of_repose
+ [2]  Cushman-Roisin, Practical Fluid Mechanics, Chapter 16 (table: dry
+      sand pile 35 deg, crater 39 deg).
+      https://cushman.host.dartmouth.edu/books/PracticalFM/Chap16.pdf
+      TU Delft thesis on angle of repose, gravity and discharge flow:
+      https://repository.tudelft.nl/file/File_e3f02dd0-88f7-4f04-8b79-2820ebfbbd86?preview=1
+ [3]  Beverloo law, constants and validity:
+      DEM Simulations of Spheres Flowing Through a Hopper (2025)
+      https://arxiv.org/abs/2512.03698v1
+      Granular flow through an aperture: influence of packing fraction
+      https://arxiv.org/pdf/1407.0883
+      Mankoc et al. 2007, Granular Matter
+      https://en.unav.edu/documents/15083165/15313261/2007.gran_matt.pdf/4ddb6882-88f6-8d2e-a515-692239907453
+ [4]  Wittmer, Cates, Claudin - Stress propagation and arching in static
+      sandpiles (point-source cone, pressure dip)
+      https://arxiv.org/pdf/cond-mat/9607097
+      Alonso, Herrmann - Shape of the tail of a 2D sand pile
+      https://arxiv.org/abs/cond-mat/9603144
+ [5]  Development of stresses in cohesionless poured sand (pressure dip)
+      https://arxiv.org/pdf/cond-mat/9803266
+ [6]  Zhou, Wright, Yang, Xu, Yu (1999) Rolling friction in the dynamic
+      simulation of sandpile formation, Physica A 269, 536-553
+      https://research.monash.edu/en/publications/rolling-friction-in-the-dynamic-simulation-of-sandpile-formation/
+ [7]  Zhou, Xu, Yu, Zulli (2001) Numerical investigation of the angle of
+      repose of monosized spheres, Phys. Rev. E
+      https://research.monash.edu/en/publications/numerical-investigation-of-the-angle-of-repose-of-monosized-spher/
+ [8]  Ai, Chen, Rotter, Ooi (2011) Assessment of rolling resistance models
+      in discrete element simulations, Powder Technology 206, 269-282
+      https://pure.qub.ac.uk/en/publications/assessment-of-rolling-resistance-models-in-discrete-element-simul/
+ [9]  Angles of dry granular heaps
+      https://www.skema.edu/en/faculty-and-research/publications/angles-dry-granular-heaps
+ [10] Angle of repose and segregation (maximum stability vs repose)
+      https://arxiv.org/pdf/cond-mat/0106572
+ [11] Jop, Forterre, Pouliquen (2006) A constitutive law for dense
+      granular flows, Nature
+      https://arxiv.org/pdf/cond-mat/0612110
+ [12] Angle of repose of spherical grains in granular Hele-Shaw cells
+      (angle vs number of grains)
+      https://arxiv.org/pdf/0711.2732
+ [13] Fall velocity of sand-sized particles in air (2015)
+      https://journals.sagepub.com/doi/10.1177/0309133314562442
+      Terminal settling velocity equations
+      https://eng.libretexts.org/Bookshelves/Civil_Engineering/Slurry_Transport_(Miedema)/04%3A_The_Terminal_Settling_Velocity_of_Particles/4.04%3A_Terminal_Settling_Velocity_Equations
+ [14] Herrmann (1999) Shapes of granular surfaces, Physica A 270, 82-88
+      (rounding of the heap top, logarithmic tails)
+      https://ideas.repec.org/a/eee/phsmap/v270y1999i1p82-88.html
+ [15] Heap slopes are slightly convex (2021 preprint)
+      https://arxiv.org/abs/2112.05264v1
+ [16] Fluctuation of the top location and avalanches in sandpile formation
+      https://arxiv.org/pdf/0706.3432
+ [17] From angle of repose to heap morphology: full-field calibration of
+      DEM (2026) - method to compare the whole heap shape, not only angle
+      https://arxiv.org/pdf/2605.09371
